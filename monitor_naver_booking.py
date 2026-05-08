@@ -191,6 +191,11 @@ def extract_available_times(page) -> list[str]:
             if not TIME_PATTERN.match(text):
                 continue
 
+            # 달력 날짜 버튼은 `1`, `14`, `23`처럼 단독 숫자로 되어 있어서
+            # 시간 후보에서 제외합니다. 실제 시간 버튼은 `10:00`, `2:00`처럼 ':'가 있습니다.
+            if ":" not in text and "오전" not in text and "오후" not in text:
+                continue
+
             try:
                 box = element.bounding_box(timeout=500)
             except Exception:
