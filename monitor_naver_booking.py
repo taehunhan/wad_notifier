@@ -10,10 +10,28 @@ BASE_URL = "https://m.booking.naver.com/booking/13/bizes/606892/items/5755658?ar
 
 # GitHub Actions Variables 또는 Secrets로 설정 가능
 DATES = os.getenv("TARGET_DATES", "2026-05-08,2026-05-09").split(",")
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
 
 # 예약 가능하다고 판단할 시간 패턴
-TIME_PATTERN = re.compile(r"\b([01]?\d|2[0-3]):[0-5]\d\b")
+TIME_PATTERN = re.compile(r"(?:오전|오후)?\s*\b([01]?\d|2[0-3])(?::([0-5]\d))?\b")
+
+AVAILABLE_KEYWORDS = [
+    "예약",
+    "선택",
+    "가능",
+    "오전",
+    "오후",
+]
+
+UNAVAILABLE_KEYWORDS = [
+    "예약 가능한 시간이 없습니다",
+    "예약할 수 없습니다",
+    "예약이 마감",
+    "휴무",
+    "선택 가능한 시간이 없습니다",
+]
 
 
 def build_url(date: str) -> str:
@@ -27,53 +45,95 @@ def build_url(date: str) -> str:
 def notify(message: str) -> None:
     print(message)
 
-    if not DISCORD_WEBHOOK_URL:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
     try:
         requests.post(
-            DISCORD_WEBHOOK_URL,
-            json={"content": message},
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "disable_web_page_preview": True,
+            },
             timeout=10,
         ).raise_for_status()
     except Exception as e:
-        print(f"[WARN] Discord notification failed: {e}", file=sys.stderr)
+        print(f"[WARN] Telegram notification failed: {e}", file=sys.stderr)
+
+
+
+def normalize_time_text(text: str) -> list[str]:
+    normalized = []
+
+    for match in TIME_PATTERN.finditer(text):
+        raw = match.group(0).strip()
+        hour = int(match.group(1))
+        minute = match.group(2) or "00"
+
+        if "오후" in raw and hour < 12:
+            hour += 12
+        elif "오전" in raw and hour == 12:
+            hour = 0
+
+        # 너무 넓은 정규식이 날짜/수량을 시간으로 오인하지 않도록
+        # 오전/오후가 없고 ':'도 없는 단독 숫자는 제외합니다.
+        if "오전" not in raw and "오후" not in raw and ":" not in raw:
+            continue
+
+        normalized.append(f"{hour:02d}:{minute}")
+
+    return normalized
 
 
 def extract_available_times(page) -> list[str]:
     """
     네이버 예약 페이지는 구조가 바뀔 수 있으므로,
-    1차로 버튼/role 기반 탐색
-    2차로 전체 텍스트에서 시간 패턴 추출
-    을 함께 사용합니다.
+    버튼/role/전체 텍스트를 모두 확인합니다.
+
+    시간 표기가 `14:00`일 수도 있고 `오후 2시`, `오후 3:00`처럼
+    표시될 수도 있어서 normalize_time_text()로 통일합니다.
     """
 
     candidates = set()
 
-    # 버튼 중 disabled가 아닌 것에서 시간처럼 보이는 텍스트 추출
-    buttons = page.locator("button")
-    count = buttons.count()
+    selectors = [
+        "button:not([disabled])",
+        "a",
+        "[role='button']",
+        "li",
+        "div",
+    ]
 
-    for i in range(count):
-        button = buttons.nth(i)
+    for selector in selectors:
+        elements = page.locator(selector)
 
         try:
-            text = button.inner_text(timeout=1000).strip()
-            disabled = button.is_disabled(timeout=1000)
+            count = min(elements.count(), 300)
         except Exception:
             continue
 
-        if disabled:
-            continue
+        for i in range(count):
+            element = elements.nth(i)
 
-        for match in TIME_PATTERN.finditer(text):
-            candidates.add(match.group(0))
+            try:
+                text = element.inner_text(timeout=500).strip()
+            except Exception:
+                continue
 
-    # fallback: 페이지 전체 텍스트에서 시간 추출
+            if not text:
+                continue
+
+            if not any(keyword in text for keyword in AVAILABLE_KEYWORDS):
+                continue
+
+            for time_text in normalize_time_text(text):
+                candidates.add(time_text)
+
     try:
         body_text = page.locator("body").inner_text(timeout=3000)
-        for match in TIME_PATTERN.finditer(body_text):
-            candidates.add(match.group(0))
+        for time_text in normalize_time_text(body_text):
+            candidates.add(time_text)
     except Exception:
         pass
 
@@ -93,24 +153,21 @@ def check_date(page, date: str) -> list[str]:
         pass
 
     # “날짜와 시간을 선택해 주세요” 영역 렌더링 여유
-    time.sleep(3)
+    time.sleep(5)
 
     # 가끔 모바일 페이지가 viewport에 따라 다르게 렌더링되므로 body 확인
     body_text = page.locator("body").inner_text(timeout=5000)
+    print(f"[DEBUG] Body text preview for {date}: {body_text[:1000]}")
 
-    # 명시적인 불가 문구가 있으면 우선 불가로 처리
-    unavailable_keywords = [
-        "예약 가능한 시간이 없습니다",
-        "예약할 수 없습니다",
-        "예약이 마감",
-        "휴무",
-        "선택 가능한 시간이 없습니다",
-    ]
+    times = extract_available_times(page)
+    if times:
+        return times
 
-    if any(keyword in body_text for keyword in unavailable_keywords):
+    # 명시적인 불가 문구가 있고, 시간 후보도 없을 때만 불가로 처리
+    if any(keyword in body_text for keyword in UNAVAILABLE_KEYWORDS):
         return []
 
-    return extract_available_times(page)
+    return []
 
 
 def main() -> int:
