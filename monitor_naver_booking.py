@@ -15,7 +15,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 
 # 예약 가능하다고 판단할 시간 패턴
-TIME_PATTERN = re.compile(r"(?:오전|오후)?\s*\b([01]?\d|2[0-3])(?::([0-5]\d))?\b")
+TIME_PATTERN = re.compile(r"^(?:오전|오후)?\s*([01]?\d|2[0-3])(?::([0-5]\d))?\s*시?$")
 
 AVAILABLE_KEYWORDS = [
     "예약",
@@ -63,46 +63,109 @@ def notify(message: str) -> None:
 
 
 
-def normalize_time_text(text: str) -> list[str]:
-    normalized = []
+def normalize_time_text(text: str, period: str | None = None) -> str | None:
+    text = text.strip()
+    match = TIME_PATTERN.match(text)
+    if not match:
+        return None
 
-    for match in TIME_PATTERN.finditer(text):
-        raw = match.group(0).strip()
-        hour = int(match.group(1))
-        minute = match.group(2) or "00"
+    hour = int(match.group(1))
+    minute = match.group(2) or "00"
+    effective_period = period
 
-        if "오후" in raw and hour < 12:
-            hour += 12
-        elif "오전" in raw and hour == 12:
-            hour = 0
+    if "오전" in text:
+        effective_period = "오전"
+    elif "오후" in text:
+        effective_period = "오후"
 
-        # 너무 넓은 정규식이 날짜/수량을 시간으로 오인하지 않도록
-        # 오전/오후가 없고 ':'도 없는 단독 숫자는 제외합니다.
-        if "오전" not in raw and "오후" not in raw and ":" not in raw:
-            continue
+    if effective_period == "오후" and hour < 12:
+        hour += 12
+    elif effective_period == "오전" and hour == 12:
+        hour = 0
 
-        normalized.append(f"{hour:02d}:{minute}")
+    return f"{hour:02d}:{minute}"
 
-    return normalized
+
+def get_period_from_y(y: float, period_markers: list[tuple[str, float]]) -> str | None:
+    current_period = None
+
+    for period, marker_y in sorted(period_markers, key=lambda item: item[1]):
+        if y >= marker_y:
+            current_period = period
+
+    return current_period
+
+
+def is_visually_available_time_element(element) -> bool:
+    try:
+        return bool(
+            element.evaluate(
+                """
+                (el) => {
+                  const text = (el.innerText || el.textContent || '').trim();
+                  const ariaDisabled = el.getAttribute('aria-disabled') === 'true';
+                  const disabled = el.disabled === true || el.hasAttribute('disabled');
+                  const className = String(el.className || '').toLowerCase();
+                  const style = window.getComputedStyle(el);
+                  const rect = el.getBoundingClientRect();
+
+                  if (!text) return false;
+                  if (disabled || ariaDisabled) return false;
+                  if (className.includes('disabled') || className.includes('unavailable')) return false;
+                  if (style.display === 'none' || style.visibility === 'hidden') return false;
+                  if (style.pointerEvents === 'none') return false;
+                  if (Number(style.opacity) < 0.5) return false;
+                  if (rect.width <= 0 || rect.height <= 0) return false;
+
+                  const colorMatch = style.color.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/);
+                  if (colorMatch) {
+                    const r = Number(colorMatch[1]);
+                    const g = Number(colorMatch[2]);
+                    const b = Number(colorMatch[3]);
+
+                    // 예약 불가 시간은 보통 연한 회색 텍스트로 렌더링됩니다.
+                    if (r >= 170 && g >= 170 && b >= 170) return false;
+                  }
+
+                  return true;
+                }
+                """
+            )
+        )
+    except Exception:
+        return False
 
 
 def extract_available_times(page) -> list[str]:
     """
-    네이버 예약 페이지는 구조가 바뀔 수 있으므로,
-    버튼/role/전체 텍스트를 모두 확인합니다.
-
-    시간 표기가 `14:00`일 수도 있고 `오후 2시`, `오후 3:00`처럼
-    표시될 수도 있어서 normalize_time_text()로 통일합니다.
+    네이버 예약 페이지의 body 전체 텍스트에는 예약 불가 시간도 함께 들어옵니다.
+    그래서 전체 텍스트에서 시간을 긁지 않고, 실제 시간 버튼처럼 보이는 요소만 검사합니다.
     """
 
     candidates = set()
+    debug_rows = []
+    period_markers = []
+
+    for period in ["오전", "오후"]:
+        labels = page.get_by_text(period, exact=True)
+        try:
+            count = labels.count()
+        except Exception:
+            continue
+
+        for i in range(count):
+            try:
+                box = labels.nth(i).bounding_box(timeout=500)
+            except Exception:
+                box = None
+
+            if box:
+                period_markers.append((period, box["y"]))
 
     selectors = [
-        "button:not([disabled])",
-        "a",
+        "button",
         "[role='button']",
-        "li",
-        "div",
+        "a",
     ]
 
     for selector in selectors:
@@ -124,19 +187,25 @@ def extract_available_times(page) -> list[str]:
             if not text:
                 continue
 
-            if not any(keyword in text for keyword in AVAILABLE_KEYWORDS):
+            # `예약하기` 같은 문구나 큰 컨테이너가 아니라, 시간 하나만 적힌 요소만 봅니다.
+            if not TIME_PATTERN.match(text):
                 continue
 
-            for time_text in normalize_time_text(text):
-                candidates.add(time_text)
+            try:
+                box = element.bounding_box(timeout=500)
+            except Exception:
+                box = None
 
-    try:
-        body_text = page.locator("body").inner_text(timeout=3000)
-        for time_text in normalize_time_text(body_text):
-            candidates.add(time_text)
-    except Exception:
-        pass
+            period = get_period_from_y(box["y"], period_markers) if box else None
+            normalized = normalize_time_text(text, period)
+            available = is_visually_available_time_element(element)
 
+            debug_rows.append(f"{text} -> {normalized}, period={period}, available={available}")
+
+            if normalized and available:
+                candidates.add(normalized)
+
+    print(f"[DEBUG] Time candidates: {debug_rows}")
     return sorted(candidates)
 
 
