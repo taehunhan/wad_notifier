@@ -3,8 +3,9 @@ name: Naver Booking Monitor
 on:
   workflow_dispatch:
   schedule:
-    # 한국시간 매일 09:00~23:00 사이 10분마다 실행
+    # 한국시간 매일 07:00~24:00 사이 10분마다 실행
     # GitHub cron은 UTC 기준이므로 KST - 9시간
+    - cron: "*/10 22-23 * * *"
     - cron: "*/10 0-14 * * *"
 
 jobs:
@@ -31,7 +32,8 @@ jobs:
 
       - name: Check Naver booking availability
         env:
-          TARGET_DATES: "2026-05-08,2026-05-09,2026-05-10"
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TARGET_DATES: ${{ vars.TARGET_DATES }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python monitor_naver_booking.py
